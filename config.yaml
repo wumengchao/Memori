@@ -1,0 +1,24 @@
+# SAA Memori Service Docker 专用配置
+# 基于 saa-backend 的 PostgreSQL 配置
+
+# 服务器配置
+server:
+  host: 0.0.0.0
+  port: 8900
+
+# PostgreSQL 配置（复用 saa-backend 的数据库实例）
+postgres:
+  host: host.docker.internal
+  port: 15432
+  user: postgres
+  password: your-super-secret-and-long-postgres-password
+  dbname: saa_memori
+  sslmode: disable
+
+# Memori 配置
+memori:
+  # 高级增强 API Key（可选，用于增加配额）
+  api_key: ""
+  # 嵌入模型配置
+  embeddings:
+    model: "sentence-transformers/all-MiniLM-L6-v2"

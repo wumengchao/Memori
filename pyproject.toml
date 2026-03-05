@@ -42,6 +42,13 @@ dependencies = [
 
 [project.optional-dependencies]
 cockroachdb = ["psycopg[binary]>=3.1.0"]
+server = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "sqlalchemy>=2.0.0",
+    "psycopg[binary]>=3.1.0",
+    "httpx>=0.27.0",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]
