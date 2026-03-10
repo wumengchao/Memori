@@ -147,10 +147,17 @@ class VolcanoEmbedder:
 
 
 class LocalSentenceTransformerEmbedder:
-    """本地 Sentence Transformers embedder（备用）"""
+    """本地 Sentence Transformers embedder（备用，需安装 optional: embedding-local）"""
 
     def __init__(self, model_name: str = "all-MiniLM-L6-v2"):
-        from sentence_transformers import SentenceTransformer
+        try:
+            from sentence_transformers import SentenceTransformer
+        except ImportError as e:
+            raise RuntimeError(
+                "本地 embeddings 需要安装 sentence-transformers。"
+                "请配置火山引擎 VOLCANO_EMBEDDING_API_KEY/VOLCANO_EMBEDDING_BASE_URL，"
+                "或安装可选依赖: uv sync --extra embedding-local"
+            ) from e
         self.model = SentenceTransformer(model_name)
 
     def embed(self, texts: list[str]) -> list[list[float]]:
@@ -175,7 +182,15 @@ def get_embedder():
             api_path=volcano_api_path,
         )
 
-    # 备用：使用本地模型
+    # 备用：使用本地模型（需安装 optional embedding-local）
+    try:
+        import sentence_transformers  # noqa: F401
+    except ImportError:
+        raise RuntimeError(
+            "未配置火山引擎 Embeddings 且未安装本地 embedder。"
+            "请设置 VOLCANO_EMBEDDING_API_KEY 与 VOLCANO_EMBEDDING_BASE_URL，"
+            "或安装可选依赖: uv sync --extra embedding-local"
+        )
     logger.info("使用本地 Sentence Transformers 模型")
     return LocalSentenceTransformerEmbedder()
 

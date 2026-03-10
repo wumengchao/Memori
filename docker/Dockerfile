@@ -3,31 +3,37 @@ FROM python:3.12-slim AS builder
 
 WORKDIR /app
 
+COPY sources.list /etc/apt/sources.list
+
 # 安装系统依赖
-RUN apt-get update && apt-get install -y \
+RUN rm -f /etc/apt/sources.list.d/debian.sources \
+    && apt-get update && apt-get install -y \
     build-essential \
     curl \
     git \
     && rm -rf /var/lib/apt/lists/*
 
-# 安装 uv 加速依赖管理
-RUN pip install uv
+# 安装 uv（使用镜像源提高稳定性）
+RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple uv
 
-COPY sources.list /etc/apt/
 
 # 复制依赖文件
 COPY pyproject.toml uv.lock* ./
 
 # 安装生产依赖（包含 PostgreSQL 和 Server 支持）
-RUN uv sync --extra cockroachdb --extra server --no-dev
+RUN uv sync --index-url https://pypi.tuna.tsinghua.edu.cn/simple \
+    --extra cockroachdb --extra server --no-dev
 
 # ============ 运行阶段 ============
 FROM python:3.12-slim
 
 WORKDIR /app
 
+COPY sources.list /etc/apt/sources.list
+
 # 安装运行时依赖
-RUN apt-get update && apt-get install -y \
+RUN rm -f /etc/apt/sources.list.d/debian.sources \
+    && apt-get update && apt-get install -y \
     curl \
     && rm -rf /var/lib/apt/lists/* \
     && ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime \

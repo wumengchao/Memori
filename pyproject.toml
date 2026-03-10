@@ -37,11 +37,15 @@ dependencies = [
     "protobuf>=4.25.0,<6.0.0",
     "pyfiglet>=0.8.0",
     "requests>=2.32.5",
-    "sentence-transformers>=3.0.0",
 ]
 
 [project.optional-dependencies]
 cockroachdb = ["psycopg[binary]>=3.1.0"]
+# ---------- 模型相关依赖（注释掉以减小 Docker 镜像，生产用火山引擎 Embeddings 无需安装）----------
+# 本地 embeddings 备用：含 sentence-transformers → PyTorch/Hugging Face，体积约 2GB+。
+# 需要本地 embedder 时取消下行注释，并执行: uv sync --extra embedding-local
+# embedding-local = ["sentence-transformers>=3.0.0"]
+# -----------------------------------------------------------------------------------------------
 server = [
     "fastapi>=0.115.0",
     "uvicorn[standard]>=0.32.0",

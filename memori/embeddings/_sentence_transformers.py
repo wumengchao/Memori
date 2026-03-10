@@ -3,14 +3,16 @@ from __future__ import annotations
 import logging
 import os
 import threading
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 import numpy as np
-from sentence_transformers import SentenceTransformer
 
 from memori.embeddings._utils import embedding_dimension, zero_vectors
+
+if TYPE_CHECKING:
+    from sentence_transformers import SentenceTransformer
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +25,8 @@ class SentenceTransformersEmbedder:
         self._encode_lock = threading.Lock()
 
     def _get_model(self) -> SentenceTransformer:
+        from sentence_transformers import SentenceTransformer
+
         with self._model_lock:
             if self._model is None:
                 self._model = SentenceTransformer(self._model_name)

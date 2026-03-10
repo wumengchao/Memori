@@ -6,7 +6,6 @@ from collections.abc import Awaitable
 from functools import partial
 from typing import Literal, overload
 
-from memori.embeddings._sentence_transformers import get_sentence_transformers_embedder
 from memori.embeddings._tei import TEI
 from memori.embeddings._tei_embed import embed_texts_via_tei
 from memori.embeddings._utils import prepare_text_inputs
@@ -38,6 +37,14 @@ def _embed_texts(
             )
             for t in inputs
         ]
+    # 延迟导入，避免未安装 sentence-transformers 时（如仅用火山引擎）启动即报错
+    try:
+        from memori.embeddings._sentence_transformers import get_sentence_transformers_embedder
+    except ImportError as e:
+        raise RuntimeError(
+            "未安装 sentence-transformers。请配置火山引擎 VOLCANO_EMBEDDING_API_KEY/VOLCANO_EMBEDDING_BASE_URL，"
+            "或安装可选依赖: uv sync --extra embedding-local"
+        ) from e
     return get_sentence_transformers_embedder(model).embed(
         inputs, fallback_dimension=_FALLBACK_DIMENSION
     )
