@@ -9,6 +9,7 @@ SAA Memori Service - FastAPI Application
 
 import os
 import logging
+import re
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -18,6 +19,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from memori import Memori
+from memori.search._types import FactSearchResult
 
 # 配置日志
 logging.basicConfig(
@@ -28,6 +30,19 @@ logger = logging.getLogger("saa-memori")
 
 # 全局 Memori 实例
 _memori_instance: Optional[Memori] = None
+_augmentation_enabled: bool = False
+
+
+def is_augmentation_enabled() -> bool:
+    """
+    增强开关策略：
+    1) MEMORI_AUGMENTATION_ENABLED 显式配置优先（true/false）
+    2) 未显式配置时：仅当 MEMORI_API_KEY 非空才启用远端增强
+    """
+    explicit = os.getenv("MEMORI_AUGMENTATION_ENABLED")
+    if explicit is not None:
+        return explicit.strip().lower() in {"1", "true", "yes", "on"}
+    return bool((os.getenv("MEMORI_API_KEY") or "").strip())
 
 
 def rollback_memori_adapter(memori: Optional[Memori]) -> None:
@@ -96,6 +111,178 @@ def persist_conversation_records(
     return conversation_db_id
 
 
+def normalize_basic_fact_texts(messages: list[dict]) -> list[str]:
+    """
+    基础记忆模式：直接从对话消息抽取可检索文本（不依赖远端增强）。
+    """
+    def _env_bool(name: str, default: bool) -> bool:
+        raw = os.getenv(name)
+        if raw is None:
+            return default
+        return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+    def _is_low_information_chunk(text: str, *, min_chars: int) -> bool:
+        content = (text or "").strip()
+        if not content:
+            return True
+
+        # 太短的文本通常是确认/寒暄，信息密度低。
+        if len(content) < min_chars:
+            return True
+
+        # 没有有效文字/数字，通常是噪声（标点、符号、emoji 等）。
+        if not re.search(r"[\u4e00-\u9fffA-Za-z0-9]", content):
+            return True
+
+        normalized = re.sub(r"[\s，,。.!！？?；;：:~～、…“”\"'`·\-_/\\|]+", "", content).lower()
+        if not normalized:
+            return True
+
+        # 常见低信息确认语。
+        low_info_set = {
+            "好",
+            "好的",
+            "好的呢",
+            "收到",
+            "明白",
+            "嗯",
+            "嗯嗯",
+            "哦",
+            "ok",
+            "okay",
+            "行",
+            "可以",
+            "是的",
+            "知道了",
+            "没问题",
+            "安排",
+            "继续",
+            "谢谢",
+            "辛苦了",
+        }
+        if normalized in low_info_set:
+            return True
+
+        # 高频重复字符（如“哈哈哈哈”“嗯嗯嗯嗯”）判为低信息。
+        if len(normalized) >= 8:
+            uniq = set(normalized)
+            max_count = max(normalized.count(ch) for ch in uniq)
+            if len(uniq) <= 3 and (max_count / len(normalized)) >= 0.6:
+                return True
+
+        return False
+
+    def _split_text_chunks(text: str, max_chars: int, overlap: int) -> list[str]:
+        content = (text or "").strip()
+        if not content:
+            return []
+        if len(content) <= max_chars:
+            return [content]
+
+        # 先按中英文句末标点切句，再按窗口拼接；避免简单按字节截断破坏语义。
+        sentences = [
+            s.strip()
+            for s in re.split(r"(?<=[。！？!?；;.\n])\s*", content)
+            if s and s.strip()
+        ]
+        if not sentences:
+            sentences = [content]
+
+        chunks: list[str] = []
+        current = ""
+        for s in sentences:
+            if not current:
+                current = s
+                continue
+            if len(current) + 1 + len(s) <= max_chars:
+                current = f"{current} {s}"
+                continue
+            chunks.append(current)
+            if overlap > 0:
+                tail = current[-overlap:]
+                current = f"{tail} {s}" if tail else s
+            else:
+                current = s
+        if current:
+            chunks.append(current)
+
+        return [c.strip() for c in chunks if c and c.strip()]
+
+    max_chars = int(os.getenv("MEMORI_BASIC_FACT_CHUNK_SIZE", "400") or "400")
+    overlap = int(os.getenv("MEMORI_BASIC_FACT_CHUNK_OVERLAP", "40") or "40")
+    min_chars = int(os.getenv("MEMORI_BASIC_FACT_MIN_CHARS", "8") or "8")
+    filter_low_info = _env_bool("MEMORI_BASIC_FACT_FILTER_LOW_INFO", True)
+    store_assistant = _env_bool("MEMORI_BASIC_FACT_STORE_ASSISTANT", True)
+    max_chars = max(120, min(2000, max_chars))
+    overlap = max(0, min(max_chars // 2, overlap))
+    min_chars = max(2, min(80, min_chars))
+
+    texts: list[str] = []
+    for msg in messages:
+        role = str(msg.get("role", "") or "").strip().lower()
+        if role not in {"user", "assistant"}:
+            continue
+        if role == "assistant" and not store_assistant:
+            continue
+        content = str(msg.get("content", "") or "").strip()
+        if not content:
+            continue
+        role_prefix = "用户" if role == "user" else "助手"
+        chunks = _split_text_chunks(content, max_chars=max_chars, overlap=overlap)
+        if not chunks:
+            continue
+        for chunk in chunks:
+            if filter_low_info and _is_low_information_chunk(chunk, min_chars=min_chars):
+                continue
+            texts.append(f"{role_prefix}: {chunk}")
+    # 去重但保持顺序
+    seen = set()
+    uniq_texts: list[str] = []
+    for t in texts:
+        if t in seen:
+            continue
+        seen.add(t)
+        uniq_texts.append(t)
+    return uniq_texts
+
+
+def persist_basic_facts(
+    memori: Memori,
+    *,
+    entity_id: str,
+    messages: list[dict],
+) -> int:
+    """
+    在增强关闭时，将消息文本直接向量化并写入 memori_entity_fact。
+    返回成功写入的 fact 数量。
+    """
+    facts = normalize_basic_fact_texts(messages)
+    if not facts:
+        return 0
+
+    embedder = get_embedder()
+    embeddings = embedder.embed(facts)
+    if not embeddings:
+        return 0
+
+    count = min(len(facts), len(embeddings))
+    if count <= 0:
+        return 0
+    if len(embeddings) != len(facts):
+        logger.warning(
+            "基础记忆向量化数量不匹配 facts=%d embeddings=%d，将按最小数量写入",
+            len(facts),
+            len(embeddings),
+        )
+
+    with memori.config.storage.conn as (_conn, adapter, driver):
+        entity_db_id = driver.entity.create(entity_id)
+        driver.entity_fact.create(entity_db_id, facts[:count], embeddings[:count])
+        adapter.commit()
+
+    return count
+
+
 class VolcanoEmbedder:
     """火山引擎 Embeddings API 客户端"""
 
@@ -106,15 +293,17 @@ class VolcanoEmbedder:
         self.api_path = api_path if api_path.startswith("/") else f"/{api_path}"
         self.client = httpx.Client(timeout=30.0)
 
-    def embed(self, texts: list[str]) -> list[list[float]]:
-        """生成文本的向量表示"""
+    def _embed_request(self, texts: list[str]) -> list[list[float]]:
+        """单次请求并解析 embeddings 结果。"""
+        if not texts:
+            return []
+
         url = f"{self.base_url}{self.api_path}"
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
 
-        # 多模态向量化接口（如 /embeddings/multimodal）要求 input 项为对象。
         use_multimodal_input = "multimodal" in self.api_path.lower()
         if use_multimodal_input:
             model_input = [{"type": "text", "text": text} for text in texts]
@@ -127,20 +316,39 @@ class VolcanoEmbedder:
             "encoding_type": "float",
         }
 
-        try:
-            response = self.client.post(url, json=payload, headers=headers)
-            response.raise_for_status()
-            data = response.json()
+        response = self.client.post(url, json=payload, headers=headers)
+        response.raise_for_status()
+        data = response.json()
+        data_field = data.get("data")
 
-            # 兼容两种返回格式：
-            # 1) data: [{embedding: [...]}, ...]
-            # 2) data: {embedding: [...]}（多模态接口常见）
-            data_field = data.get("data")
-            if isinstance(data_field, list):
-                return [item["embedding"] for item in data_field if "embedding" in item]
-            if isinstance(data_field, dict) and "embedding" in data_field:
-                return [data_field["embedding"]]
-            raise ValueError("unexpected embeddings response format")
+        if isinstance(data_field, list):
+            return [item["embedding"] for item in data_field if "embedding" in item]
+        if isinstance(data_field, dict) and "embedding" in data_field:
+            return [data_field["embedding"]]
+        return []
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        """生成文本的向量表示"""
+        try:
+            vectors = self._embed_request(texts)
+            if len(vectors) == len(texts):
+                return vectors
+
+            # 兼容部分接口在批量输入时仅返回单向量：降级为逐条请求，保证 1:1 对齐。
+            if len(texts) > 1:
+                logger.warning(
+                    "Embeddings 批量返回数量异常 texts=%d vectors=%d，降级逐条请求",
+                    len(texts),
+                    len(vectors),
+                )
+                per_item_vectors: list[list[float]] = []
+                for text in texts:
+                    single = self._embed_request([text])
+                    if single:
+                        per_item_vectors.append(single[0])
+                return per_item_vectors
+
+            return vectors
         except Exception as e:
             logger.error(f"火山引擎 Embeddings 调用失败: {e}")
             raise
@@ -245,7 +453,7 @@ def create_db_connection():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""
-    global _memori_instance
+    global _memori_instance, _augmentation_enabled
 
     logger.info("正在初始化 Memori 服务...")
 
@@ -286,9 +494,12 @@ async def lifespan(app: FastAPI):
         else:
             logger.info("使用默认本地 embeddings 模型")
 
-        # 启动 augmentation 后台处理
-        _memori_instance.augmentation.start(session_factory)
-        logger.info("Memori Augmentation 后台处理已启动")
+        _augmentation_enabled = is_augmentation_enabled()
+        if _augmentation_enabled:
+            _memori_instance.augmentation.start(session_factory)
+            logger.info("Memori Augmentation 后台处理已启动")
+        else:
+            logger.info("Memori Augmentation 已禁用（MEMORI_API_KEY 为空或开关关闭）")
 
         logger.info("Memori 服务启动成功")
 
@@ -388,6 +599,190 @@ class StoreResponse(BaseModel):
     session_id: Optional[str] = Field(None, description="会话ID")
 
 
+def _normalize_recall_item(item: object) -> tuple[str, float, Optional[str], Optional[str]]:
+    """兼容 FactSearchResult / dict / 字符串 三种 recall 返回结构。"""
+    if isinstance(item, FactSearchResult):
+        score = float(item.rank_score if item.rank_score is not None else item.similarity)
+        return item.content, score, "fact", item.date_created
+
+    if isinstance(item, dict):
+        content = str(item.get("content", "") or "")
+        raw_score = item.get("score", item.get("rank_score", item.get("similarity", 0.0)))
+        try:
+            score = float(raw_score)
+        except (TypeError, ValueError):
+            score = 0.0
+        memory_type = item.get("memory_type")
+        created_at = item.get("created_at", item.get("date_created"))
+        return content, score, str(memory_type) if memory_type is not None else None, str(created_at) if created_at is not None else None
+
+    if isinstance(item, str):
+        return item, 0.0, "fact", None
+
+    return "", 0.0, None, None
+
+
+_IDENTITY_FACT_PATTERNS = (
+    re.compile(r"^self\s+is\s+(家长|parent|father|mother)\b", re.IGNORECASE),
+    re.compile(r"^self\s+has\s+(id|name|role)\b", re.IGNORECASE),
+)
+_IDENTITY_QUERY_HINTS = (
+    "你是谁",
+    "我是谁",
+    "身份",
+    "角色",
+    "叫什么",
+    "家长",
+    "parent",
+    "father",
+    "mother",
+    "name",
+    "role",
+    "id",
+)
+
+
+def _is_identity_fact(content: str) -> bool:
+    text = (content or "").strip()
+    if not text:
+        return False
+    return any(p.search(text) for p in _IDENTITY_FACT_PATTERNS)
+
+
+def _is_identity_query(query: str) -> bool:
+    q = (query or "").strip().lower()
+    if not q:
+        return False
+    return any(hint in q for hint in _IDENTITY_QUERY_HINTS)
+
+
+_ROLE_PREFIX_RE = re.compile(r"^\s*(用户|助手)\s*:\s*", re.IGNORECASE)
+_LEADING_ROLE_JSON_RE = re.compile(
+    r'^\s*\{[^{}]*"角色"\s*:\s*"[^"]+"[^{}]*\}\s*',
+    re.DOTALL,
+)
+_TASK_CONTEXT_BLOCK_RE = re.compile(
+    r"^\s*<task_context>[\s\S]*?</task_context>\s*",
+    re.IGNORECASE,
+)
+
+
+def _strip_recall_noise_prefix(content: str) -> str:
+    """
+    清理 recall 文本前缀中的模板噪声（角色 JSON / task_context）。
+    仅做前缀清理，不改正文语义。
+    """
+    text = (content or "").strip()
+    if not text:
+        return ""
+
+    role_prefix = ""
+    role_match = _ROLE_PREFIX_RE.match(text)
+    if role_match:
+        role_prefix = f"{role_match.group(1)}: "
+        text = text[role_match.end() :].lstrip()
+
+    changed = True
+    while changed and text:
+        changed = False
+        m_role = _LEADING_ROLE_JSON_RE.match(text)
+        if m_role:
+            text = text[m_role.end() :].lstrip()
+            changed = True
+        m_task = _TASK_CONTEXT_BLOCK_RE.match(text)
+        if m_task:
+            text = text[m_task.end() :].lstrip()
+            changed = True
+
+    if not text:
+        return ""
+    if role_prefix:
+        return role_prefix + text
+    return text
+
+
+def _canonical_recall_key(content: str) -> str:
+    """
+    为 recall 去重生成稳定 key：去前缀模板后，再去空白/标点差异。
+    """
+    base = _strip_recall_noise_prefix(content)
+    if not base:
+        return ""
+    base = _ROLE_PREFIX_RE.sub("", base).lower()
+    # 只保留中文、英文、数字，消除格式差异导致的“伪不同”
+    key = re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", base)
+    return key[:240]
+
+
+def _dedupe_recall_items(
+    items: list[tuple[str, float, Optional[str], Optional[str]]],
+    limit: int,
+) -> list[tuple[str, float, Optional[str], Optional[str]]]:
+    """
+    recall 结果去重：保持原排序，按清洗后文本 key 去重。
+    """
+    deduped: list[tuple[str, float, Optional[str], Optional[str]]] = []
+    seen_keys: set[str] = set()
+
+    for content, score, memory_type, created_at in items:
+        cleaned = _strip_recall_noise_prefix(content)
+        if not cleaned:
+            continue
+        key = _canonical_recall_key(cleaned)
+        if not key:
+            continue
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        deduped.append((cleaned, score, memory_type, created_at))
+        if len(deduped) >= limit:
+            break
+
+    return deduped
+
+
+def _get_recall_fetch_limit(limit: int) -> int:
+    """
+    召回候选扩充倍率：
+    - 优先使用 Memori 内置排序，多取候选供后续去重/阈值过滤
+    - 默认倍率 2，最大 5，最终上限 100
+    """
+    raw = os.getenv("MEMORI_RECALL_FETCH_MULTIPLIER", "2")
+    try:
+        mul = int(raw)
+    except ValueError:
+        mul = 2
+    mul = max(1, min(5, mul))
+    return min(100, max(limit, limit * mul))
+
+
+def _get_recall_min_score() -> float:
+    """
+    recall 最低分阈值（基于 Memori rank_score / similarity）。
+    默认 0.18（在噪声较多的语音场景更稳），可通过环境变量覆盖：
+    MEMORI_RECALL_MIN_SCORE=0.18
+    """
+    raw = os.getenv("MEMORI_RECALL_MIN_SCORE", "0.18")
+    try:
+        score = float(raw)
+    except ValueError:
+        score = 0.0
+    return max(0.0, min(1.0, score))
+
+
+def _get_recall_min_score_ratio() -> float:
+    """
+    相对阈值：保留 score >= (top_score * ratio) 的候选。
+    默认 0.45，值越大召回越“聚焦”。
+    """
+    raw = os.getenv("MEMORI_RECALL_MIN_SCORE_RATIO", "0.45")
+    try:
+        ratio = float(raw)
+    except ValueError:
+        ratio = 0.45
+    return max(0.0, min(1.0, ratio))
+
+
 # ============ API 端点 ============
 
 @app.get("/health", response_model=HealthResponse, tags=["健康检查"])
@@ -441,23 +836,62 @@ async def recall_memories(request: RecallRequest):
             process_id=request.process_id,
         )
 
-        # 执行检索
-        results = memori.recall(query=request.query, limit=request.limit)
+        effective_limit = request.limit or 10
+        fetch_limit = _get_recall_fetch_limit(effective_limit)
+
+        # 执行检索（优先依赖 Memori 内置混合排序，先扩候选）
+        results = memori.recall(query=request.query, limit=fetch_limit)
 
         # 转换结果
         memories = []
         context_parts = []
+        normalized_items = []
 
         for item in results:
+            content, score, memory_type, created_at = _normalize_recall_item(item)
+            if not content:
+                continue
+            normalized_items.append((content, score, memory_type, created_at))
+
+        # 对非身份类问题，降低“self is 家长/parent”等身份事实的主导性，优先返回主题记忆
+        if normalized_items and not _is_identity_query(request.query):
+            non_identity = [it for it in normalized_items if not _is_identity_fact(it[0])]
+            identity = [it for it in normalized_items if _is_identity_fact(it[0])]
+            if non_identity:
+                normalized_items = non_identity + identity[:1]
+
+        min_score = _get_recall_min_score()
+        min_score_ratio = _get_recall_min_score_ratio()
+        if normalized_items:
+            top_score = float(normalized_items[0][1])
+            ratio_floor = top_score * min_score_ratio
+            final_min_score = max(min_score, ratio_floor)
+
+            before = len(normalized_items)
+            normalized_items = [it for it in normalized_items if float(it[1]) >= final_min_score]
+            logger.debug(
+                "Memori recall 最低分过滤已应用 min_score=%.3f ratio=%.2f top=%.3f final=%.3f before=%d after=%d",
+                min_score,
+                min_score_ratio,
+                top_score,
+                final_min_score,
+                before,
+                len(normalized_items),
+            )
+
+        # 去模板前缀噪声并按语义 key 去重，减少重复上下文污染。
+        normalized_items = _dedupe_recall_items(normalized_items, effective_limit)
+
+        # 应用 limit，保持接口语义稳定
+        for content, score, memory_type, created_at in normalized_items[:effective_limit]:
             memory = MemoryItem(
-                content=item.get("content", ""),
-                score=item.get("score", 0.0),
-                memory_type=item.get("memory_type"),
-                created_at=item.get("created_at"),
+                content=content,
+                score=score,
+                memory_type=memory_type,
+                created_at=created_at,
             )
             memories.append(memory)
-            if memory.content:
-                context_parts.append(memory.content)
+            context_parts.append(memory.content)
 
         # 拼接上下文
         context = "\n".join(context_parts) if context_parts else None
@@ -541,15 +975,22 @@ async def store_conversation(request: StoreRequest):
             for msg in messages
         ]
 
-        # 触发增强任务：提取事实并更新总结
-        augmentation_input = AugmentationInput(
-            conversation_id=str(conversation_db_id),
-            entity_id=request.entity_id,
-            process_id=request.process_id,
-            conversation_messages=conversation_messages,
-        )
-
-        memori.augmentation.enqueue(augmentation_input)
+        # 触发增强任务：提取事实并更新总结（可配置关闭）
+        if _augmentation_enabled:
+            augmentation_input = AugmentationInput(
+                conversation_id=str(conversation_db_id),
+                entity_id=request.entity_id,
+                process_id=request.process_id,
+                conversation_messages=conversation_messages,
+            )
+            memori.augmentation.enqueue(augmentation_input)
+        else:
+            written = persist_basic_facts(
+                memori,
+                entity_id=request.entity_id,
+                messages=messages,
+            )
+            logger.info("基础记忆模式已写入 facts=%d entity_id=%s", written, request.entity_id)
 
         logger.info(f"已存储对话 entity_id={request.entity_id} session_id={session_id} messages={len(messages)}")
 
@@ -638,6 +1079,8 @@ async def wait_for_augmentation():
     通常在短生命周期的程序中使用，生产环境可以忽略。
     """
     try:
+        if not _augmentation_enabled:
+            return {"success": True, "message": "增强已禁用，无需等待"}
         memori = get_memori()
         memori.augmentation.wait()
 

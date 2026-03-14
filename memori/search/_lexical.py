@@ -11,6 +11,7 @@ from memori.search._types import FactId
 logger = logging.getLogger(__name__)
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
+_CJK_BLOCK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+")
 _STOPWORDS = {
     "a",
     "an",
@@ -56,9 +57,30 @@ _STOPWORDS = {
 }
 
 
+def _extract_cjk_tokens(text: str) -> list[str]:
+    """为中文/日文汉字文本生成词元：单字 + 相邻双字。"""
+    tokens: list[str] = []
+    for block in _CJK_BLOCK_RE.findall(text or ""):
+        if not block:
+            continue
+        # 单字 token，兼顾短查询
+        tokens.extend(list(block))
+        # 双字 token，提升语义判别能力（如“天气”“内蒙”）
+        if len(block) >= 2:
+            tokens.extend(block[i : i + 2] for i in range(len(block) - 1))
+    return tokens
+
+
+def _contains_cjk(text: str) -> bool:
+    return bool(_CJK_BLOCK_RE.search(text or ""))
+
+
 def _tokenize(text: str) -> list[str]:
     tokens = [t for t in _TOKEN_RE.findall((text or "").lower()) if t]
-    return [t for t in tokens if t not in _STOPWORDS]
+    latin_tokens = [t for t in tokens if t not in _STOPWORDS]
+    cjk_tokens = _extract_cjk_tokens(text or "")
+    # 去重会损失词频，BM25需要保留重复 token
+    return latin_tokens + cjk_tokens
 
 
 def lexical_scores_for_ids(
@@ -123,16 +145,27 @@ def dense_lexical_weights(*, query_text: str) -> tuple[float, float]:
     """
     q_tokens = _tokenize(query_text)
 
+    has_cjk = _contains_cjk(query_text)
+    # 中文/多语言场景提升 lexical 权重，缓解“中文 query + 英文 fact”时语义向量偏置。
+    default_lex = "0.30" if has_cjk else "0.15"
+    default_lex_short = "0.40" if has_cjk else "0.30"
+
     try:
-        w_lex = float(os.environ.get("MEMORI_RECALL_LEX_WEIGHT", "0.15") or "0.15")
+        w_lex = float(
+            os.environ.get("MEMORI_RECALL_LEX_WEIGHT", default_lex) or default_lex
+        )
     except ValueError:
-        w_lex = 0.15
+        w_lex = float(default_lex)
+
     if len(q_tokens) <= 2:
         try:
             w_lex = float(
-                os.environ.get("MEMORI_RECALL_LEX_WEIGHT_SHORT", "0.30") or "0.30"
+                os.environ.get(
+                    "MEMORI_RECALL_LEX_WEIGHT_SHORT", default_lex_short
+                )
+                or default_lex_short
             )
         except ValueError:
-            w_lex = 0.30
+            w_lex = float(default_lex_short)
     w_lex = max(0.05, min(0.40, w_lex))
     return (1.0 - w_lex, w_lex)
