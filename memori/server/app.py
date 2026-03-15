@@ -111,6 +111,108 @@ def persist_conversation_records(
     return conversation_db_id
 
 
+_INLINE_JSON_OBJECT_RE = re.compile(r"\{[^{}]{2,1200}\}")
+_INLINE_JSON_ARRAY_RE = re.compile(r"\[[^\[\]]{2,1200}\]")
+_TASK_CONTEXT_ANYWHERE_RE = re.compile(r"<task_context>[\s\S]*?</task_context>", re.IGNORECASE)
+
+
+def _strip_json_like_payload(text: str) -> str:
+    """
+    移除文本中的 JSON 串噪声（常见于角色元数据、task_context 透传片段）。
+    仅删除明显 JSON-like 片段：包含 ":" 且带引号/花括号结构。
+    """
+    content = text or ""
+    if not content:
+        return ""
+
+    def _drop_json_object(match: re.Match[str]) -> str:
+        block = match.group(0)
+        if ":" in block and ('"' in block or "'" in block):
+            return " "
+        return block
+
+    def _drop_json_array(match: re.Match[str]) -> str:
+        block = match.group(0)
+        if "{" in block and ":" in block:
+            return " "
+        return block
+
+    content = _INLINE_JSON_OBJECT_RE.sub(_drop_json_object, content)
+    content = _INLINE_JSON_ARRAY_RE.sub(_drop_json_array, content)
+    return content
+
+
+def _compact_plain_text(text: str) -> str:
+    """去换行、折叠多空格，输出单行可检索文本。"""
+    content = (text or "").replace("\r", " ").replace("\n", " ")
+    content = re.sub(r"\s+", " ", content)
+    return content.strip()
+
+
+def _sanitize_memory_text(text: str) -> str:
+    """统一清洗：去 JSON 串 + 去换行 + 去冗余空格。"""
+    content = text or ""
+    content = _TASK_CONTEXT_ANYWHERE_RE.sub(" ", content)
+    return _compact_plain_text(_strip_json_like_payload(content))
+
+
+def build_local_conversation_summary(messages: list[dict]) -> str:
+    """
+    本地轻量摘要（无远端增强时兜底）：
+    - 基于基础 fact 片段拼接摘要，避免 memori_conversation.summary 为空
+    - 保持可读、可检索，不引入额外模型调用
+    """
+    max_items_raw = os.getenv("MEMORI_LOCAL_SUMMARY_MAX_ITEMS", "4")
+    max_chars_raw = os.getenv("MEMORI_LOCAL_SUMMARY_MAX_CHARS", "400")
+    try:
+        max_items = int(max_items_raw)
+    except ValueError:
+        max_items = 4
+    try:
+        max_chars = int(max_chars_raw)
+    except ValueError:
+        max_chars = 400
+
+    max_items = max(1, min(10, max_items))
+    max_chars = max(120, min(2000, max_chars))
+
+    facts = normalize_basic_fact_texts(messages)
+    if not facts:
+        return ""
+
+    parts: list[str] = []
+    current_len = 0
+    for item in facts:
+        if len(parts) >= max_items:
+            break
+        add_len = len(item) + (2 if parts else 0)
+        if current_len + add_len > max_chars:
+            break
+        parts.append(item)
+        current_len += add_len
+
+    if not parts:
+        return ""
+    return "；".join(parts)
+
+
+def persist_conversation_summary(
+    memori: Memori,
+    *,
+    conversation_id: int,
+    summary: str,
+) -> bool:
+    """写入 memori_conversation.summary。"""
+    text = (summary or "").strip()
+    if not text:
+        return False
+
+    with memori.config.storage.conn as (_conn, adapter, driver):
+        driver.conversation.update(conversation_id, text)
+        adapter.commit()
+    return True
+
+
 def normalize_basic_fact_texts(messages: list[dict]) -> list[str]:
     """
     基础记忆模式：直接从对话消息抽取可检索文本（不依赖远端增强）。
@@ -224,7 +326,7 @@ def normalize_basic_fact_texts(messages: list[dict]) -> list[str]:
             continue
         if role == "assistant" and not store_assistant:
             continue
-        content = str(msg.get("content", "") or "").strip()
+        content = _sanitize_memory_text(str(msg.get("content", "") or ""))
         if not content:
             continue
         role_prefix = "用户" if role == "user" else "助手"
@@ -697,8 +799,8 @@ def _strip_recall_noise_prefix(content: str) -> str:
     if not text:
         return ""
     if role_prefix:
-        return role_prefix + text
-    return text
+        return _compact_plain_text(role_prefix + _sanitize_memory_text(text))
+    return _sanitize_memory_text(text)
 
 
 def _canonical_recall_key(content: str) -> str:
@@ -968,6 +1070,17 @@ async def store_conversation(request: StoreRequest):
             session_uuid=session_id,
             messages=messages,
         )
+
+        # 补齐 conversation.summary（增强关闭场景尤为重要）。
+        local_summary = build_local_conversation_summary(messages)
+        if local_summary:
+            updated = persist_conversation_summary(
+                memori,
+                conversation_id=conversation_db_id,
+                summary=local_summary,
+            )
+            if updated:
+                logger.info("已更新会话摘要 conversation_id=%s", conversation_db_id)
 
         # 转换为 Memori 的 ConversationMessage 格式（用于增强管线）
         conversation_messages = [
